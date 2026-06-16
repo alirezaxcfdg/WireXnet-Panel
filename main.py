@@ -8,6 +8,7 @@ import re
 from datetime import datetime
 from urllib.parse import quote
 from collections import deque, defaultdict
+import uuid as uuid_lib
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
@@ -38,6 +39,7 @@ app.add_middleware(
 connections: dict = {}
 connection_sockets: dict = {}
 link_ip_map: dict = defaultdict(set)
+link_connections: dict = defaultdict(set)  # link_uuid -> set of connection_ids
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
 error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
@@ -52,18 +54,22 @@ CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 SESSION_COOKIE = "wirex_session"
 SESSION_TTL = 60 * 60 * 24 * 7
 
+
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
+
 
 AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "admin"))}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
+
 
 async def create_session() -> str:
     token = secrets.token_urlsafe(32)
     async with SESSIONS_LOCK:
         SESSIONS[token] = time.time() + SESSION_TTL
     return token
+
 
 async def is_valid_session(token: str | None) -> bool:
     if not token:
@@ -75,16 +81,19 @@ async def is_valid_session(token: str | None) -> bool:
             return False
         return True
 
+
 async def destroy_session(token: str | None):
     if token:
         async with SESSIONS_LOCK:
             SESSIONS.pop(token, None)
+
 
 async def require_auth(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     if not await is_valid_session(token):
         raise HTTPException(status_code=401, detail="unauthorized")
     return token
+
 
 async def keep_alive():
     while True:
@@ -98,6 +107,7 @@ async def keep_alive():
         except Exception:
             pass
 
+
 @app.on_event("startup")
 async def startup():
     global http_client
@@ -107,19 +117,16 @@ async def startup():
     logger.info(f"WireXnet started on port {CONFIG['port']}")
     asyncio.create_task(keep_alive())
 
+
 @app.on_event("shutdown")
 async def shutdown():
     if http_client:
         await http_client.aclose()
 
+
 def get_domain() -> str:
     return os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost")).replace("https://", "").replace("http://", "")
 
-def generate_uuid(seed: str | None = None) -> str:
-    if seed is None:
-        return str(secrets.token_hex(16))[:8] + "-" + secrets.token_hex(2) + "-" + secrets.token_hex(2) + "-" + secrets.token_hex(2) + "-" + secrets.token_hex(6)
-    h = hashlib.sha256(f"{seed}{CONFIG['secret']}".encode()).hexdigest()
-    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 def generate_vless_link(uuid: str, remark: str = "WireXnet", address: str = None) -> str:
     domain = get_domain()
@@ -138,22 +145,37 @@ def generate_vless_link(uuid: str, remark: str = "WireXnet", address: str = None
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     return f"vless://{uuid}@{addr}:443?{query}#{quote(remark)}"
 
+
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
     h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+
 def parse_size_to_bytes(value: float, unit: str) -> int:
     unit = unit.upper()
-    if unit == "GB": return int(value * 1024 * 1024 * 1024)
-    if unit == "MB": return int(value * 1024 * 1024)
-    if unit == "KB": return int(value * 1024)
+    if unit == "GB":
+        return int(value * 1024 * 1024 * 1024)
+    if unit == "MB":
+        return int(value * 1024 * 1024)
+    if unit == "KB":
+        return int(value * 1024)
     return int(value)
+
 
 async def ensure_default_link():
     async with LINKS_LOCK:
         if not LINKS:
-            LINKS["Default"] = {"label": "Default", "limit_bytes": 0, "used_bytes": 0, "max_connections": 0, "created_at": datetime.now().isoformat(), "active": True}
+            uid = str(uuid_lib.uuid4())
+            LINKS[uid] = {
+                "label": "Default",
+                "limit_bytes": 0,
+                "used_bytes": 0,
+                "max_connections": 0,
+                "created_at": datetime.now().isoformat(),
+                "active": True
+            }
+
 
 def get_client_ip(websocket: WebSocket) -> str:
     forwarded = websocket.headers.get("x-forwarded-for")
@@ -163,14 +185,17 @@ def get_client_ip(websocket: WebSocket) -> str:
         return websocket.client.host
     return "unknown"
 
+
 def count_connections_for_link(uid: str) -> int:
-    return len(link_ip_map.get(uid, set()))
+    return len(link_connections.get(uid, set()))
+
 
 def remove_ip_from_link(uid: str, ip: str):
     if uid in link_ip_map:
         link_ip_map[uid].discard(ip)
         if not link_ip_map[uid]:
             link_ip_map.pop(uid, None)
+
 
 async def close_connections_for_link(uid: str):
     to_close = [cid for cid, info in connections.items() if info.get("uuid") == uid]
@@ -184,14 +209,18 @@ async def close_connections_for_link(uid: str):
         connections.pop(cid, None)
         connection_sockets.pop(cid, None)
     link_ip_map.pop(uid, None)
+    link_connections.pop(uid, None)
+
 
 @app.get("/")
 async def root():
     return {"service": "WireXnet", "version": "1.0", "status": "active", "domain": get_domain()}
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "connections": len(connections), "uptime": uptime()}
+
 
 @app.post("/api/login")
 async def api_login(request: Request):
@@ -204,6 +233,7 @@ async def api_login(request: Request):
     resp.set_cookie(key=SESSION_COOKIE, value=token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
     return resp
 
+
 @app.post("/api/logout")
 async def api_logout(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
@@ -212,10 +242,12 @@ async def api_logout(request: Request):
     resp.delete_cookie(SESSION_COOKIE, path="/")
     return resp
 
+
 @app.get("/api/me")
 async def api_me(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     return {"authenticated": await is_valid_session(token)}
+
 
 @app.post("/api/change-password")
 async def api_change_password(request: Request, _=Depends(require_auth)):
@@ -234,8 +266,14 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
             SESSIONS[current_token] = time.time() + SESSION_TTL
     return {"ok": True}
 
+
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
+    # Count active connections per link
+    active_counts = {}
+    for uid in LINKS:
+        active_counts[uid] = count_connections_for_link(uid)
+    
     return {
         "active_connections": len(connections),
         "total_traffic_mb": round(stats["total_bytes"] / (1024 * 1024), 2),
@@ -249,6 +287,7 @@ async def get_stats(_=Depends(require_auth)):
         "cpu_percent": psutil.cpu_percent(interval=0.1),
         "memory_percent": psutil.virtual_memory().percent,
         "hourly_traffic": dict(hourly_traffic),
+        "link_connections": active_counts,
     }
 
 
@@ -260,28 +299,64 @@ async def create_link(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="Inbound name must contain only English letters, numbers, and characters: - _ . space")
     if not label:
         raise HTTPException(status_code=400, detail="Inbound name is required")
+    
+    # Generate random UUID
+    uid = str(uuid_lib.uuid4())
+    
     async with LINKS_LOCK:
-        if label in LINKS:
-            raise HTTPException(status_code=400, detail="An inbound with this name already exists")
+        # Check if label exists
+        for existing_uid, data in LINKS.items():
+            if data["label"] == label:
+                raise HTTPException(status_code=400, detail="An inbound with this name already exists")
+    
     limit_value = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
     limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
     max_conn = int(body.get("max_connections") or 0)
     if max_conn < 0:
         max_conn = 0
-    uid = label
+    
     async with LINKS_LOCK:
-        LINKS[uid] = {"label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "created_at": datetime.now().isoformat(), "active": True}
-    return {"uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"], "vless_link": generate_vless_link(uid, remark=f"WireXnet-{label}")}
+        LINKS[uid] = {
+            "label": label,
+            "limit_bytes": limit_bytes,
+            "used_bytes": 0,
+            "max_connections": max_conn,
+            "created_at": datetime.now().isoformat(),
+            "active": True
+        }
+    
+    return {
+        "uuid": uid,
+        "label": label,
+        "limit_bytes": limit_bytes,
+        "used_bytes": 0,
+        "max_connections": max_conn,
+        "active": True,
+        "created_at": LINKS[uid]["created_at"],
+        "vless_link": generate_vless_link(uid, remark=f"WireXnet-{label}")
+    }
+
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     result = []
     async with LINKS_LOCK:
         for uid, data in LINKS.items():
-            result.append({"uuid": uid, "label": data["label"], "limit_bytes": data["limit_bytes"], "used_bytes": data["used_bytes"], "max_connections": data.get("max_connections", 0), "active": data["active"], "created_at": data["created_at"], "current_connections": count_connections_for_link(uid), "vless_link": generate_vless_link(uid, remark=f"WireXnet-{data['label']}")})
+            result.append({
+                "uuid": uid,
+                "label": data["label"],
+                "limit_bytes": data["limit_bytes"],
+                "used_bytes": data["used_bytes"],
+                "max_connections": data.get("max_connections", 0),
+                "active": data["active"],
+                "created_at": data["created_at"],
+                "current_connections": count_connections_for_link(uid),
+                "vless_link": generate_vless_link(uid, remark=f"WireXnet-{data['label']}")
+            })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
+
 
 @app.patch("/api/links/{uid}")
 async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
@@ -303,6 +378,7 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             mc = int(body["max_connections"] or 0)
             LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
     return {"ok": True}
+
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
@@ -341,6 +417,7 @@ async def delete_address(index: int, _=Depends(require_auth)):
         else:
             raise HTTPException(status_code=404, detail="Address not found")
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
+
 
 @app.get("/api/links/{uid}/sub")
 async def get_subscription(uid: str, _=Depends(require_auth)):
@@ -409,79 +486,110 @@ async def subscription_endpoint(uid: str):
     }
     return Response(content=encoded, headers=headers)
 
+
 RELAY_BUF = 64 * 1024
+
 
 async def parse_vless_header(first_chunk: bytes):
     if len(first_chunk) < 24:
         raise ValueError("chunk too small")
     pos = 0
-    pos += 1; pos += 16
-    addon_len = first_chunk[pos]; pos += 1; pos += addon_len
-    command = first_chunk[pos]; pos += 1
-    port = int.from_bytes(first_chunk[pos:pos + 2], "big"); pos += 2
-    addr_type = first_chunk[pos]; pos += 1
+    pos += 1
+    pos += 16
+    addon_len = first_chunk[pos]
+    pos += 1
+    pos += addon_len
+    command = first_chunk[pos]
+    pos += 1
+    port = int.from_bytes(first_chunk[pos:pos + 2], "big")
+    pos += 2
+    addr_type = first_chunk[pos]
+    pos += 1
     if addr_type == 1:
-        addr_bytes = first_chunk[pos:pos + 4]; pos += 4
+        addr_bytes = first_chunk[pos:pos + 4]
+        pos += 4
         address = ".".join(str(b) for b in addr_bytes)
     elif addr_type == 2:
-        domain_len = first_chunk[pos]; pos += 1
-        address = first_chunk[pos:pos + domain_len].decode("utf-8", errors="ignore"); pos += domain_len
+        domain_len = first_chunk[pos]
+        pos += 1
+        address = first_chunk[pos:pos + domain_len].decode("utf-8", errors="ignore")
+        pos += domain_len
     elif addr_type == 3:
-        addr_bytes = first_chunk[pos:pos + 16]; pos += 16
+        addr_bytes = first_chunk[pos:pos + 16]
+        pos += 16
         address = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0, 16, 2))
     else:
         raise ValueError(f"unknown address type: {addr_type}")
     return command, address, port, first_chunk[pos:]
 
+
 async def check_quota(uid: str, extra_bytes: int) -> bool:
     async with LINKS_LOCK:
         link = LINKS.get(uid)
-        if link is None: return False
-        if not link["active"]: return False
-        if link["limit_bytes"] == 0: return True
+        if link is None:
+            return False
+        if not link["active"]:
+            return False
+        if link["limit_bytes"] == 0:
+            return True
         return (link["used_bytes"] + extra_bytes) <= link["limit_bytes"]
+
 
 async def add_usage(uid: str, n: int):
     async with LINKS_LOCK:
         if uid in LINKS:
             LINKS[uid]["used_bytes"] += n
 
+
 async def ws_to_tcp(websocket: WebSocket, writer: asyncio.StreamWriter, conn_id: str, link_uid: str):
     try:
         while True:
             msg = await websocket.receive()
-            if msg["type"] == "websocket.disconnect": break
+            if msg["type"] == "websocket.disconnect":
+                break
             data = msg.get("bytes") or (msg.get("text") or "").encode()
-            if not data: continue
+            if not data:
+                continue
             size = len(data)
             if not await check_quota(link_uid, size):
-                await websocket.close(code=1008, reason="quota exceeded"); break
-            stats["total_bytes"] += size; stats["total_requests"] += 1
+                await websocket.close(code=1008, reason="quota exceeded")
+                break
+            stats["total_bytes"] += size
+            stats["total_requests"] += 1
             connections[conn_id]["bytes"] += size
             hourly_traffic[datetime.now().strftime("%H:00")] += size
             await add_usage(link_uid, size)
-            writer.write(data); await writer.drain()
-    except WebSocketDisconnect: pass
+            writer.write(data)
+            await writer.drain()
+    except WebSocketDisconnect:
+        pass
     finally:
-        try: writer.write_eof()
-        except: pass
+        try:
+            writer.write_eof()
+        except:
+            pass
+
 
 async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id: str, link_uid: str):
     first = True
     try:
         while True:
             data = await reader.read(RELAY_BUF)
-            if not data: break
+            if not data:
+                break
             size = len(data)
             if not await check_quota(link_uid, size):
-                await websocket.close(code=1008, reason="quota exceeded"); break
+                await websocket.close(code=1008, reason="quota exceeded")
+                break
             stats["total_bytes"] += size
             connections[conn_id]["bytes"] += size
             hourly_traffic[datetime.now().strftime("%H:00")] += size
             await add_usage(link_uid, size)
             await websocket.send_bytes((b"\x00\x00" + data) if first else data)
             first = False
-    except: pass
+    except:
+        pass
+
 
 @app.websocket("/ws/{uuid}")
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
@@ -494,28 +602,41 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         async with LINKS_LOCK:
             link_data = LINKS.get(uuid)
             if link_data is None or not link_data["active"]:
-                await websocket.close(code=1008, reason="link not found or disabled"); return
+                await websocket.close(code=1008, reason="link not found or disabled")
+                return
             max_conn = link_data.get("max_connections", 0)
+        
         if max_conn > 0:
-            already_connected = client_ip in link_ip_map.get(uuid, set())
-            if not already_connected:
-                current = count_connections_for_link(uuid)
-                if current >= max_conn:
-                    await websocket.close(code=1008, reason="connection limit reached"); return
+            current = count_connections_for_link(uuid)
+            if current >= max_conn:
+                await websocket.close(code=1008, reason="connection limit reached")
+                return
+        
         first_msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
-        if first_msg["type"] == "websocket.disconnect": return
+        if first_msg["type"] == "websocket.disconnect":
+            return
         first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
-        if not first_chunk: return
+        if not first_chunk:
+            return
         command, address, port, initial_payload = await parse_vless_header(first_chunk)
         conn_id = secrets.token_urlsafe(8)
-        connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now().isoformat(), "bytes": 0}
+        connections[conn_id] = {
+            "uuid": uuid,
+            "ip": client_ip,
+            "connected_at": datetime.now().isoformat(),
+            "bytes": 0
+        }
         connection_sockets[conn_id] = websocket
         link_ip_map[uuid].add(client_ip)
+        link_connections[uuid].add(conn_id)
+        
         size = len(first_chunk)
-        stats["total_bytes"] += size; stats["total_requests"] += 1
+        stats["total_bytes"] += size
+        stats["total_requests"] += 1
         connections[conn_id]["bytes"] += size
         hourly_traffic[datetime.now().strftime("%H:00")] += size
         await add_usage(uuid, size)
+        
         reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=10.0)
         if initial_payload:
             p_size = len(initial_payload)
@@ -523,25 +644,35 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
             connections[conn_id]["bytes"] += p_size
             hourly_traffic[datetime.now().strftime("%H:00")] += p_size
             await add_usage(uuid, p_size)
-            writer.write(initial_payload); await writer.drain()
+            writer.write(initial_payload)
+            await writer.drain()
+        
         task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
         task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid))
         done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
-        for t in pending: t.cancel()
-    except WebSocketDisconnect: pass
+        for t in pending:
+            t.cancel()
+    except WebSocketDisconnect:
+        pass
     except Exception as exc:
         stats["total_errors"] += 1
         error_logs.append({"error": str(exc), "time": datetime.now().isoformat()})
     finally:
         if writer:
-            try: writer.close()
-            except: pass
+            try:
+                writer.close()
+            except:
+                pass
         if conn_id:
             info = connections.pop(conn_id, None)
             connection_sockets.pop(conn_id, None)
             if info:
                 uid = info.get("uuid")
                 ip = info.get("ip")
+                if uid:
+                    link_connections[uid].discard(conn_id)
+                    if not link_connections.get(uid):
+                        link_connections.pop(uid, None)
                 if uid and ip:
                     has_other = any(c.get("uuid") == uid and c.get("ip") == ip for c in connections.values())
                     if not has_other:
@@ -915,10 +1046,6 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
         <div class="page-title">Dashboard</div>
         <div class="page-sub" id="last-update">Updated: --</div>
       </div>
-      <div style="display:flex;gap:8px">
-        <button class="btn btn-secondary" onclick="quickCreate(0.5,'GB')">+ 0.5 GB</button>
-        <button class="btn btn-primary" onclick="quickCreate(1,'GB')">+ 1 GB</button>
-      </div>
     </div>
     <div class="stats-row">
       <div class="stat-card">
@@ -981,7 +1108,7 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
             <th>Remark</th>
             <th style="width:56px">Type</th>
             <th>Traffic</th>
-            <th style="width:80px">IPs</th>
+            <th style="width:80px">Connections</th>
             <th style="width:64px">Status</th>
             <th style="width:120px">Actions</th>
           </tr></thead>
@@ -1060,7 +1187,7 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
       </div>
     </div>
     <div class="form-group">
-      <label class="form-label">Max IPs</label>
+      <label class="form-label">Max Connections</label>
       <input class="form-input" id="new-maxconn" type="number" min="0" step="1" placeholder="0 = Unlimited">
     </div>
     <button class="btn btn-primary" onclick="createLink()" style="width:100%;margin-top:8px;justify-content:center">Create</button>
@@ -1107,7 +1234,7 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:
       </div>
     </div>
     <div class="form-group">
-      <label class="form-label">Max IPs</label>
+      <label class="form-label">Max Connections</label>
       <input class="form-input" id="edit-maxconn" type="number" min="0" step="1" placeholder="0 = Unlimited">
     </div>
     <div style="display:flex;gap:8px;margin-top:12px">
@@ -1180,21 +1307,22 @@ function renderLinks(links){
     const pct=lim>0?Math.min(100,(u/lim)*100):0;
     const col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)';
     const i=idx--;
-    return {l,uF,lF,pct,col,i,maxConn:l.max_connections||0,curConn:l.current_connections||0};
+    const isOnline = l.current_connections > 0;
+    return {l,uF,lF,pct,col,i,maxConn:l.max_connections||0,curConn:l.current_connections||0,isOnline};
   });
   tbody.innerHTML=rows.map(r=>`<tr>
     <td style="color:var(--text3);font-size:11px;font-weight:600">${r.i}</td>
-    <td style="font-weight:600;font-size:13px">${esc(r.l.label)}</td>
+    <td style="font-weight:600;font-size:13px">${esc(r.l.label)} ${r.isOnline ? '<span style="color:var(--green);font-size:10px">● Online</span>' : '<span style="color:var(--text3);font-size:10px">● Offline</span>'}</td>
     <td><span class="tag tag-vless">VLESS</span></td>
     <td><div class="usage-pill"><span class="used">${r.uF}</span><div class="bar"><div class="fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="limit">${r.lF}</span></div></td>
     <td style="font-size:12px;font-weight:600;color:${r.maxConn>0&&r.curConn>=r.maxConn?'var(--red)':'var(--text2)'}">${r.curConn}/${r.maxConn||'∞'}</td>
     <td><span class="tag ${r.l.active?'tag-active':'tag-disabled'}">${r.l.active?'On':'Off'}</span></td>
     <td><div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="toggleLink(this)" title="Toggle"></button>
-      <button class="btn btn-secondary btn-sm" onclick="showEditModal('${r.l.uuid}')" title="Edit" style="background:rgba(255,170,0,0.1);color:var(--yellow);border:1px solid rgba(255,170,0,0.2)">✎</button>
-      <button class="btn-copy" onclick="copyLinkText('${esc(r.l.vless_link)}')" title="Copy">📋</button>
-      <button class="btn-copy" onclick="copySubLink('${r.l.uuid}')" title="Sub" style="background:var(--green-dim);color:var(--green);border:1px solid var(--green-dim)">📡</button>
-      <button class="btn-qr" onclick="showQRText('${esc(r.l.vless_link)}')" title="QR">◈</button>
+      <button class="btn btn-secondary btn-sm" onclick="showEditModal('${r.l.uuid}')" title="Edit" style="background:rgba(255,170,0,0.1);color:var(--yellow);border:1px solid rgba(255,170,0,0.2)">Edit</button>
+      <button class="btn-copy" onclick="copyLinkText('${esc(r.l.vless_link)}')" title="Copy">Copy</button>
+      <button class="btn-copy" onclick="copySubLink('${r.l.uuid}')" title="Sub" style="background:var(--green-dim);color:var(--green);border:1px solid var(--green-dim)">Sub</button>
+      <button class="btn-qr" onclick="showQRText('${esc(r.l.vless_link)}')" title="QR">QR</button>
       <button class="btn btn-danger btn-sm" onclick="deleteLink('${r.l.uuid}')" title="Delete">✕</button>
     </div></td>
   </tr>`).join('');
@@ -1205,16 +1333,17 @@ function renderLinks(links){
         <span class="inbound-card-id">#${r.i}</span>
         <span class="inbound-card-name">${esc(r.l.label)}</span>
         <span class="tag tag-vless">VLESS</span>
+        ${r.isOnline ? '<span style="color:var(--green);font-size:10px;font-weight:600">● Online</span>' : '<span style="color:var(--text3);font-size:10px">● Offline</span>'}
       </div>
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="toggleLink(this)"></button>
     </div>
     <div class="usage-pill"><span class="used">${r.uF}</span><div class="bar"><div class="fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="limit">${r.lF}</span></div>
-    <div style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2)"><span style="font-weight:600;color:${r.maxConn>0&&r.curConn>=r.maxConn?'var(--red)':'var(--text)'}">${r.curConn}/${r.maxConn||'∞'}</span> IPs</div>
+    <div style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2)"><span style="font-weight:600;color:${r.maxConn>0&&r.curConn>=r.maxConn?'var(--red)':'var(--text)'}">${r.curConn}/${r.maxConn||'∞'}</span> Connections</div>
     <div class="inbound-card-actions">
-      <button class="btn btn-secondary btn-sm" onclick="showEditModal('${r.l.uuid}')" style="background:rgba(255,170,0,0.1);color:var(--yellow);border:1px solid rgba(255,170,0,0.2)">✎</button>
-      <button class="btn-copy" onclick="copyLinkText('${esc(r.l.vless_link)}')">📋</button>
-      <button class="btn-copy" onclick="copySubLink('${r.l.uuid}')" style="background:var(--green-dim);color:var(--green);border:1px solid var(--green-dim)">📡</button>
-      <button class="btn-qr" onclick="showQRText('${esc(r.l.vless_link)}')">◈</button>
+      <button class="btn btn-secondary btn-sm" onclick="showEditModal('${r.l.uuid}')" style="background:rgba(255,170,0,0.1);color:var(--yellow);border:1px solid rgba(255,170,0,0.2)">Edit</button>
+      <button class="btn-copy" onclick="copyLinkText('${esc(r.l.vless_link)}')">Copy</button>
+      <button class="btn-copy" onclick="copySubLink('${r.l.uuid}')" style="background:var(--green-dim);color:var(--green);border:1px solid var(--green-dim)">Sub</button>
+      <button class="btn-qr" onclick="showQRText('${esc(r.l.vless_link)}')">QR</button>
       <button class="btn btn-danger btn-sm" onclick="deleteLink('${r.l.uuid}')">✕</button>
     </div>
   </div>`).join('');
@@ -1233,19 +1362,12 @@ async function toggleLink(el){
   }catch(e){}
 }
 
-async function quickCreate(limit,unit){
-  const names=['Alpha','Beta','Gamma','Delta','Epsilon','Zeta','Eta','Theta','Iota','Kappa'];
-  const name=names[Math.floor(Math.random()*names.length)]+'-'+Math.floor(Math.random()*100);
-  try{const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:name,limit_value:limit,limit_unit:unit})});if(!r.ok)throw new Error();toast('Created: '+name);await loadLinks();await loadStats();}catch(e){toast('Error',true)}
-}
-
 async function createLink(){
   const label=$('#new-label').value.trim()||'New Link';const val=parseFloat($('#new-limit').value)||0;const unit='GB';const maxconn=parseInt($('#new-maxconn').value)||0;
   if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return;}
   try{const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:val,limit_unit:unit,max_connections:maxconn})});if(!r.ok)throw new Error();toast('Created');$('#new-label').value='';$('#new-limit').value='';$('#new-maxconn').value='';$('#add-modal').classList.remove('show');await loadLinks();await loadStats();}catch(e){toast('Error',true)}
 }
 
-async function resetUsage(uid){try{await fetch(`/api/links/${uid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');await loadLinks();}catch(e){}}
 async function deleteLink(uid){if(!confirm('Delete this inbound?'))return;try{await fetch(`/api/links/${uid}`,{method:'DELETE'});toast('Deleted');await loadLinks();await loadStats();}catch(e){}}
 
 function showEditModal(uid){
@@ -1298,7 +1420,7 @@ async function changePassword(){
 
 applyTheme(theme);
 loadStats();loadLinks();loadAddresses();
-setInterval(()=>{loadStats()},10000);
+setInterval(()=>{loadStats();loadLinks()},10000);
 
 let allAddresses=[];
 
@@ -1405,12 +1527,14 @@ async def login_page(request: Request):
         return RedirectResponse(url="/dashboard")
     return HTMLResponse(content=LOGIN_HTML)
 
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     if not await is_valid_session(token):
         return RedirectResponse(url="/login")
     return HTMLResponse(content=DASHBOARD_HTML)
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=CONFIG["port"])
