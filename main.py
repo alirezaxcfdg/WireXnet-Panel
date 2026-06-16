@@ -4,6 +4,7 @@ import os
 import hashlib
 import secrets
 import time
+import re
 from datetime import datetime
 from urllib.parse import quote
 from collections import deque, defaultdict
@@ -36,6 +37,7 @@ app.add_middleware(
 
 connections: dict = {}
 connection_sockets: dict = {}
+link_ip_map: dict = defaultdict(set)
 stats = {"total_bytes": 0, "total_requests": 0, "total_errors": 0, "start_time": time.time()}
 error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
@@ -43,6 +45,9 @@ http_client: httpx.AsyncClient | None = None
 
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
+
+CUSTOM_ADDRESSES: list = ["www.speedtest.net"]
+CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 
 SESSION_COOKIE = "ren_session"
 SESSION_TTL = 60 * 60 * 24 * 7
@@ -116,8 +121,9 @@ def generate_uuid(seed: str | None = None) -> str:
     h = hashlib.sha256(f"{seed}{CONFIG['secret']}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
-def generate_vless_link(uuid: str, remark: str = "REN") -> str:
+def generate_vless_link(uuid: str, remark: str = "REN", address: str = None) -> str:
     domain = get_domain()
+    addr = address if address else domain
     path = f"/ws/{uuid}"
     params = {
         "encryption": "none",
@@ -130,7 +136,7 @@ def generate_vless_link(uuid: str, remark: str = "REN") -> str:
         "alpn": "http/1.1",
     }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uuid}@{domain}:443?{query}#{quote(remark)}"
+    return f"vless://{uuid}@{addr}:443?{query}#{quote(remark)}"
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
@@ -147,8 +153,24 @@ def parse_size_to_bytes(value: float, unit: str) -> int:
 async def ensure_default_link():
     async with LINKS_LOCK:
         if not LINKS:
-            uid = generate_uuid("default")
-            LINKS[uid] = {"label": "Default", "limit_bytes": 0, "used_bytes": 0, "created_at": datetime.now().isoformat(), "active": True}
+            LINKS["Default"] = {"label": "Default", "limit_bytes": 0, "used_bytes": 0, "max_connections": 0, "created_at": datetime.now().isoformat(), "active": True}
+
+def get_client_ip(websocket: WebSocket) -> str:
+    forwarded = websocket.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if websocket.client:
+        return websocket.client.host
+    return "unknown"
+
+def count_connections_for_link(uid: str) -> int:
+    return len(link_ip_map.get(uid, set()))
+
+def remove_ip_from_link(uid: str, ip: str):
+    if uid in link_ip_map:
+        link_ip_map[uid].discard(ip)
+        if not link_ip_map[uid]:
+            link_ip_map.pop(uid, None)
 
 async def close_connections_for_link(uid: str):
     to_close = [cid for cid, info in connections.items() if info.get("uuid") == uid]
@@ -161,6 +183,7 @@ async def close_connections_for_link(uid: str):
                 pass
         connections.pop(cid, None)
         connection_sockets.pop(cid, None)
+    link_ip_map.pop(uid, None)
 
 @app.get("/")
 async def root():
@@ -228,24 +251,35 @@ async def get_stats(_=Depends(require_auth)):
         "hourly_traffic": dict(hourly_traffic),
     }
 
+
 @app.post("/api/links")
 async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
     label = (body.get("label") or "New Link").strip()[:60]
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', label):
+        raise HTTPException(status_code=400, detail="Inbound name must contain only English letters, numbers, and characters: - _ . space")
+    if not label:
+        raise HTTPException(status_code=400, detail="Inbound name is required")
+    async with LINKS_LOCK:
+        if label in LINKS:
+            raise HTTPException(status_code=400, detail="An inbound with this name already exists")
     limit_value = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
     limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
-    uid = generate_uuid(label)
+    max_conn = int(body.get("max_connections") or 0)
+    if max_conn < 0:
+        max_conn = 0
+    uid = label
     async with LINKS_LOCK:
-        LINKS[uid] = {"label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "created_at": datetime.now().isoformat(), "active": True}
-    return {"uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "active": True, "created_at": LINKS[uid]["created_at"], "vless_link": generate_vless_link(uid, remark=f"REN-{label}")}
+        LINKS[uid] = {"label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "created_at": datetime.now().isoformat(), "active": True}
+    return {"uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"], "vless_link": generate_vless_link(uid, remark=f"REN-{label}")}
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
     result = []
     async with LINKS_LOCK:
         for uid, data in LINKS.items():
-            result.append({"uuid": uid, "label": data["label"], "limit_bytes": data["limit_bytes"], "used_bytes": data["used_bytes"], "active": data["active"], "created_at": data["created_at"], "vless_link": generate_vless_link(uid, remark=f"REN-{data['label']}")})
+            result.append({"uuid": uid, "label": data["label"], "limit_bytes": data["limit_bytes"], "used_bytes": data["used_bytes"], "max_connections": data.get("max_connections", 0), "active": data["active"], "created_at": data["created_at"], "current_connections": count_connections_for_link(uid), "vless_link": generate_vless_link(uid, remark=f"REN-{data['label']}")})
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
 
@@ -265,6 +299,9 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             LINKS[uid]["used_bytes"] = 0
         if "label" in body:
             LINKS[uid]["label"] = str(body["label"])[:60]
+        if "max_connections" in body:
+            mc = int(body["max_connections"] or 0)
+            LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
@@ -273,6 +310,104 @@ async def delete_link(uid: str, _=Depends(require_auth)):
         LINKS.pop(uid, None)
     await close_connections_for_link(uid)
     return {"ok": True}
+
+
+@app.get("/api/addresses")
+async def list_addresses(_=Depends(require_auth)):
+    async with CUSTOM_ADDRESSES_LOCK:
+        return {"addresses": list(CUSTOM_ADDRESSES)}
+
+
+@app.post("/api/addresses")
+async def add_address(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    address = (body.get("address") or "").strip()
+    if not address:
+        raise HTTPException(status_code=400, detail="Address is required")
+    if not re.match(r'^[a-zA-Z0-9\-_. ]+$', address):
+        raise HTTPException(status_code=400, detail="Address must contain only English letters, numbers, and characters: - _ .")
+    async with CUSTOM_ADDRESSES_LOCK:
+        if address in CUSTOM_ADDRESSES:
+            raise HTTPException(status_code=400, detail="Address already exists")
+        CUSTOM_ADDRESSES.append(address)
+    return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
+
+
+@app.delete("/api/addresses/{index}")
+async def delete_address(index: int, _=Depends(require_auth)):
+    async with CUSTOM_ADDRESSES_LOCK:
+        if 0 <= index < len(CUSTOM_ADDRESSES):
+            CUSTOM_ADDRESSES.pop(index)
+        else:
+            raise HTTPException(status_code=404, detail="Address not found")
+    return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
+
+@app.get("/api/links/{uid}/sub")
+async def get_subscription(uid: str, _=Depends(require_auth)):
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if link is None:
+            raise HTTPException(status_code=404, detail="link not found")
+    vless_link = generate_vless_link(uid, remark=f"REN-{link['label']}")
+    used = link["used_bytes"]
+    limit = link["limit_bytes"]
+    used_mb = round(used / (1024 * 1024), 2)
+    limit_mb = round(limit / (1024 * 1024), 2) if limit > 0 else 0
+    pct = round((used / limit) * 100, 1) if limit > 0 else 0
+    remaining_mb = round((limit - used) / (1024 * 1024), 2) if limit > 0 else 0
+    import base64
+    sub_content = f"""# REN Subscription
+# Label: {link['label']}
+# Used: {used_mb} MB / {limit_mb if limit > 0 else 'Unlimited'} MB
+# Remaining: {remaining_mb if limit > 0 else 'Unlimited'} MB
+# Usage: {pct}%
+# Status: {'Active' if link['active'] else 'Disabled'}
+# Expiry: Unlimited
+{vless_link}"""
+    encoded = base64.b64encode(sub_content.encode()).decode()
+    return {
+        "subscription_url": f"{get_domain()}/api/links/{uid}/sub",
+        "config": vless_link,
+        "label": link["label"],
+        "used_bytes": used,
+        "limit_bytes": limit,
+        "used_mb": used_mb,
+        "limit_mb": limit_mb,
+        "remaining_mb": remaining_mb,
+        "usage_percent": pct,
+        "active": link["active"],
+        "sub_base64": encoded,
+        "sub_text": sub_content,
+    }
+
+
+@app.get("/sub/{uid}")
+async def subscription_endpoint(uid: str):
+    import base64
+    async with LINKS_LOCK:
+        link = LINKS.get(uid)
+        if link is None:
+            raise HTTPException(status_code=404, detail="link not found")
+    if not link["active"]:
+        raise HTTPException(status_code=403, detail="link disabled")
+    async with CUSTOM_ADDRESSES_LOCK:
+        addresses = list(CUSTOM_ADDRESSES)
+    sub_links = []
+    server_link = generate_vless_link(uid, remark=f"REN-{link['label']}-Server")
+    sub_links.append(server_link)
+    for i, addr in enumerate(addresses):
+        remark = f"REN-{link['label']}-IP{i+1}"
+        vless_link = generate_vless_link(uid, remark=remark, address=addr)
+        sub_links.append(vless_link)
+    sub_content = "\n".join(sub_links)
+    encoded = base64.b64encode(sub_content.encode()).decode()
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Disposition": "attachment; filename=\"sub.txt\"",
+        "profile-update-interval": "6",
+        "subscription-userinfo": f"upload={link['used_bytes']}; download=0; total={link['limit_bytes']}; expire=0"
+    }
+    return Response(content=encoded, headers=headers)
 
 RELAY_BUF = 64 * 1024
 
@@ -352,18 +487,30 @@ async def tcp_to_ws(websocket: WebSocket, reader: asyncio.StreamReader, conn_id:
 async def websocket_tunnel(websocket: WebSocket, uuid: str):
     await ensure_default_link()
     await websocket.accept()
-    conn_id = secrets.token_urlsafe(8)
-    connections[conn_id] = {"uuid": uuid, "connected_at": datetime.now().isoformat(), "bytes": 0}
-    connection_sockets[conn_id] = websocket
     writer = None
+    conn_id = None
+    client_ip = get_client_ip(websocket)
     try:
-        if not await check_quota(uuid, 0):
-            await websocket.close(code=1008, reason="quota exceeded or link deleted"); return
+        async with LINKS_LOCK:
+            link_data = LINKS.get(uuid)
+            if link_data is None or not link_data["active"]:
+                await websocket.close(code=1008, reason="link not found or disabled"); return
+            max_conn = link_data.get("max_connections", 0)
+        if max_conn > 0:
+            already_connected = client_ip in link_ip_map.get(uuid, set())
+            if not already_connected:
+                current = count_connections_for_link(uuid)
+                if current >= max_conn:
+                    await websocket.close(code=1008, reason="connection limit reached"); return
         first_msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
         if first_msg["type"] == "websocket.disconnect": return
         first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
         if not first_chunk: return
         command, address, port, initial_payload = await parse_vless_header(first_chunk)
+        conn_id = secrets.token_urlsafe(8)
+        connections[conn_id] = {"uuid": uuid, "ip": client_ip, "connected_at": datetime.now().isoformat(), "bytes": 0}
+        connection_sockets[conn_id] = websocket
+        link_ip_map[uuid].add(client_ip)
         size = len(first_chunk)
         stats["total_bytes"] += size; stats["total_requests"] += 1
         connections[conn_id]["bytes"] += size
@@ -389,8 +536,16 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
         if writer:
             try: writer.close()
             except: pass
-        connections.pop(conn_id, None)
-        connection_sockets.pop(conn_id, None)
+        if conn_id:
+            info = connections.pop(conn_id, None)
+            connection_sockets.pop(conn_id, None)
+            if info:
+                uid = info.get("uuid")
+                ip = info.get("ip")
+                if uid and ip:
+                    has_other = any(c.get("uuid") == uid and c.get("ip") == ip for c in connections.values())
+                    if not has_other:
+                        remove_ip_from_link(uid, ip)
 
 
 LOGIN_HTML = r"""<!DOCTYPE html>
@@ -404,39 +559,69 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-html[data-theme="dark"]{--bg:#0a0a0a;--surface:#141414;--surface2:#1c1c1c;--border:rgba(255,255,255,0.06);--text:rgba(255,255,255,0.92);--text2:rgba(255,255,255,0.5);--text3:rgba(255,255,255,0.25);--primary:#dc2626;--primary-glow:rgba(220,38,38,0.15);--accent:#991b1b;--error:#ef4444;--error-bg:rgba(239,68,68,0.08)}
-html[data-theme="light"]{--bg:#ffffff;--surface:#ffffff;--surface2:#f9fafb;--border:rgba(0,0,0,0.06);--text:rgba(0,0,0,0.88);--text2:rgba(0,0,0,0.5);--text3:rgba(0,0,0,0.25);--primary:#16a34a;--primary-glow:rgba(22,163,74,0.12);--accent:#15803d;--error:#dc2626;--error-bg:rgba(220,38,38,0.06)}
-body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--text);transition:background .3s,color .3s}
+html[data-theme="dark"]{--bg:#050508;--surface:rgba(20,20,20,0.85);--surface2:#1c1c1c;--border:rgba(255,255,255,0.06);--text:rgba(255,255,255,0.92);--text2:rgba(255,255,255,0.5);--text3:rgba(255,255,255,0.25);--primary:#dc2626;--primary-glow:rgba(220,38,38,0.15);--accent:#991b1b;--error:#ef4444;--error-bg:rgba(239,68,68,0.08);--orb1:rgba(220,38,38,0.12);--orb2:rgba(153,27,27,0.1);--orb3:rgba(239,68,68,0.06)}
+html[data-theme="light"]{--bg:#f8f9fa;--surface:rgba(255,255,255,0.9);--surface2:#f9fafb;--border:rgba(0,0,0,0.06);--text:rgba(0,0,0,0.88);--text2:rgba(0,0,0,0.5);--text3:rgba(0,0,0,0.25);--primary:#16a34a;--primary-glow:rgba(22,163,74,0.12);--accent:#15803d;--error:#dc2626;--error-bg:rgba(220,38,38,0.06);--orb1:rgba(22,163,74,0.1);--orb2:rgba(21,128,61,0.08);--orb3:rgba(34,197,94,0.05)}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--text);transition:background .5s,color .5s;overflow:hidden}
+
+.bg-canvas{position:fixed;inset:0;z-index:0;pointer-events:none}
+.orb{position:absolute;border-radius:50%;filter:blur(80px);opacity:0;animation:orbFloat 20s ease-in-out infinite}
+.orb-1{width:400px;height:400px;background:var(--orb1);top:-10%;left:-5%;animation-delay:0s}
+.orb-2{width:350px;height:350px;background:var(--orb2);bottom:-10%;right:-5%;animation-delay:-7s}
+.orb-3{width:250px;height:250px;background:var(--orb3);top:40%;left:60%;animation-delay:-14s}
+@keyframes orbFloat{0%,100%{transform:translate(0,0) scale(1);opacity:0.6}25%{transform:translate(60px,-40px) scale(1.1);opacity:0.8}50%{transform:translate(-30px,50px) scale(0.9);opacity:0.5}75%{transform:translate(40px,20px) scale(1.05);opacity:0.7}}
+
+.grid-bg{position:fixed;inset:0;z-index:0;opacity:0.03;background-image:linear-gradient(rgba(255,255,255,0.1) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.1) 1px,transparent 1px);background-size:60px 60px;pointer-events:none}
 
 .toolbar{position:fixed;top:20px;right:20px;display:flex;gap:6px;z-index:10}
-.toolbar button{width:36px;height:36px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text2);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:15px;transition:all .2s}
-.toolbar button:hover{border-color:var(--primary);color:var(--primary)}
-.toolbar button.active{background:var(--primary);color:#fff;border-color:var(--primary)}
+.toolbar button{width:36px;height:36px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text2);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:15px;transition:all .3s;backdrop-filter:blur(20px)}
+.toolbar button:hover{border-color:var(--primary);color:var(--primary);transform:scale(1.05)}
 
-.login-page{width:100%;max-width:380px;padding:0 20px}
-.login-card{background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:44px 36px 36px;position:relative;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08)}
-.login-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--primary)}
+.login-page{width:100%;max-width:380px;padding:0 20px;position:relative;z-index:1}
+.login-card{background:var(--surface);border:1px solid var(--border);border-radius:24px;padding:48px 36px 36px;position:relative;overflow:hidden;backdrop-filter:blur(40px);box-shadow:0 8px 40px rgba(0,0,0,0.15),0 0 80px rgba(220,38,38,0.05);animation:cardIn .8s cubic-bezier(0.16,1,0.3,1) forwards;opacity:0;transform:translateY(30px) scale(0.96)}
+@keyframes cardIn{to{opacity:1;transform:translateY(0) scale(1)}}
+.login-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--primary),transparent);animation:shimmer 3s ease-in-out infinite}
+@keyframes shimmer{0%,100%{opacity:0.5;transform:scaleX(0.5)}50%{opacity:1;transform:scaleX(1)}}
+.login-card::after{content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(circle at var(--mx,50%) var(--my,50%),rgba(220,38,38,0.04) 0%,transparent 50%);pointer-events:none;transition:opacity .3s;opacity:0}
+.login-card:hover::after{opacity:1}
 
 .brand{text-align:center;margin-bottom:36px}
-.brand svg{margin-bottom:20px}
-.brand h1{font-size:20px;font-weight:700;color:var(--text);letter-spacing:-0.02em}
-.brand p{font-size:12px;color:var(--text3);margin-top:6px;font-weight:500;letter-spacing:0.04em;text-transform:uppercase}
+.brand svg{margin-bottom:20px;filter:drop-shadow(0 0 20px rgba(220,38,38,0.3));animation:logoPulse 4s ease-in-out infinite}
+@keyframes logoPulse{0%,100%{filter:drop-shadow(0 0 20px rgba(220,38,38,0.3));transform:scale(1)}50%{filter:drop-shadow(0 0 30px rgba(220,38,38,0.5));transform:scale(1.02)}}
+.brand h1{font-size:22px;font-weight:800;color:var(--text);letter-spacing:-0.03em;animation:fadeUp .6s .2s ease both}
+.brand p{font-size:11px;color:var(--text3);margin-top:6px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;animation:fadeUp .6s .3s ease both}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
 
-.form-group{margin-bottom:20px}
-.form-group label{display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.04em}
-.form-group input{width:100%;padding:11px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:14px;font-family:inherit;outline:none;transition:all .2s}
-.form-group input:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-glow)}
+.form-group{margin-bottom:20px;animation:fadeUp .6s .4s ease both}
+.form-group label{display:block;font-size:11px;font-weight:700;color:var(--text2);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.06em}
+.form-group input{width:100%;padding:13px 16px;background:var(--surface2);border:1.5px solid var(--border);border-radius:12px;color:var(--text);font-size:14px;font-family:inherit;outline:none;transition:all .3s cubic-bezier(0.4,0,0.2,1)}
+.form-group input:focus{border-color:var(--primary);box-shadow:0 0 0 4px var(--primary-glow),0 0 20px var(--primary-glow)}
 .form-group input::placeholder{color:var(--text3)}
 
-.login-btn{width:100%;padding:12px;background:var(--primary);border:none;border-radius:10px;color:#fff;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;transition:all .2s;letter-spacing:0.01em}
-.login-btn:hover{filter:brightness(1.1);transform:translateY(-1px);box-shadow:0 4px 16px rgba(79,124,255,0.3)}
-.login-btn:active{transform:translateY(0)}
+.login-btn{width:100%;padding:13px;background:var(--primary);border:none;border-radius:12px;color:#fff;font-size:14px;font-weight:700;font-family:inherit;cursor:pointer;transition:all .3s cubic-bezier(0.4,0,0.2,1);letter-spacing:0.02em;position:relative;overflow:hidden;animation:fadeUp .6s .5s ease both}
+.login-btn::before{content:'';position:absolute;top:50%;left:50%;width:0;height:0;background:rgba(255,255,255,0.2);border-radius:50%;transform:translate(-50%,-50%);transition:width .5s,height .5s}
+.login-btn:hover{filter:brightness(1.15);transform:translateY(-2px);box-shadow:0 8px 25px rgba(220,38,38,0.35)}
+.login-btn:hover::before{width:300px;height:300px}
+.login-btn:active{transform:translateY(0) scale(0.98)}
+.login-btn:active::before{width:0;height:0;transition:width .1s,height .1s}
 
-.error-msg{background:var(--error-bg);border:1px solid rgba(255,77,106,0.15);color:var(--error);padding:10px 14px;border-radius:10px;font-size:13px;display:none;margin-bottom:20px;text-align:center;font-weight:500}
+.error-msg{background:var(--error-bg);border:1px solid rgba(255,77,106,0.15);color:var(--error);padding:10px 14px;border-radius:10px;font-size:13px;display:none;margin-bottom:20px;text-align:center;font-weight:500;animation:shake .4s ease}
 .error-msg.show{display:block}
+@keyframes shake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-6px)}40%,80%{transform:translateX(6px)}}
+
+.particles{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.particle{position:absolute;width:2px;height:2px;background:var(--primary);border-radius:50%;opacity:0;animation:particleFall linear infinite}
+@keyframes particleFall{0%{opacity:0;transform:translateY(-10px) scale(0)}10%{opacity:0.6;transform:translateY(0) scale(1)}90%{opacity:0.3;transform:translateY(calc(100vh - 20px)) scale(0.5)}100%{opacity:0;transform:translateY(100vh) scale(0)}}
 </style>
 </head>
 <body>
+<div class="bg-canvas">
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+  <div class="orb orb-3"></div>
+</div>
+<div class="grid-bg"></div>
+<div class="particles" id="particles"></div>
+
 <div class="toolbar">
   <button id="lang-toggle" onclick="cycleLang()" title="Language">EN</button>
   <button id="theme-toggle" onclick="toggleTheme()" title="Theme">
@@ -444,18 +629,35 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;min-height:
   </button>
 </div>
 <div class="login-page">
-  <div class="login-card">
+  <div class="login-card" id="login-card">
     <div class="brand">
-      <svg width="56" height="56" viewBox="0 0 56 56" fill="none">
+      <svg width="60" height="60" viewBox="0 0 56 56" fill="none">
         <rect width="56" height="56" rx="14" fill="url(#logo-grad)"/>
-        <circle cx="28" cy="28" r="14" stroke="#fff" stroke-width="1.5" opacity="0.3"/>
-        <circle cx="28" cy="18" r="3.5" fill="#fff"/>
-        <circle cx="19" cy="33" r="3.5" fill="#fff"/>
-        <circle cx="37" cy="33" r="3.5" fill="#fff"/>
-        <line x1="28" y1="21.5" x2="21" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <line x1="28" y1="21.5" x2="35" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <line x1="22.5" y1="33" x2="33.5" y2="33" stroke="#fff" stroke-width="1.5" opacity="0.8"/>
-        <circle cx="28" cy="28" r="2" fill="#fff" opacity="0.9"/>
+        <circle cx="28" cy="28" r="14" stroke="#fff" stroke-width="1.5" opacity="0.3">
+          <animateTransform attributeName="transform" type="rotate" from="0 28 28" to="360 28 28" dur="20s" repeatCount="indefinite"/>
+        </circle>
+        <circle cx="28" cy="18" r="3.5" fill="#fff">
+          <animate attributeName="r" values="3.5;4;3.5" dur="3s" repeatCount="indefinite"/>
+        </circle>
+        <circle cx="19" cy="33" r="3.5" fill="#fff">
+          <animate attributeName="r" values="3.5;4;3.5" dur="3s" begin="1s" repeatCount="indefinite"/>
+        </circle>
+        <circle cx="37" cy="33" r="3.5" fill="#fff">
+          <animate attributeName="r" values="3.5;4;3.5" dur="3s" begin="2s" repeatCount="indefinite"/>
+        </circle>
+        <line x1="28" y1="21.5" x2="21" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8">
+          <animate attributeName="opacity" values="0.8;0.4;0.8" dur="2s" repeatCount="indefinite"/>
+        </line>
+        <line x1="28" y1="21.5" x2="35" y2="30" stroke="#fff" stroke-width="1.5" opacity="0.8">
+          <animate attributeName="opacity" values="0.8;0.4;0.8" dur="2s" begin="0.5s" repeatCount="indefinite"/>
+        </line>
+        <line x1="22.5" y1="33" x2="33.5" y2="33" stroke="#fff" stroke-width="1.5" opacity="0.8">
+          <animate attributeName="opacity" values="0.8;0.4;0.8" dur="2s" begin="1s" repeatCount="indefinite"/>
+        </line>
+        <circle cx="28" cy="28" r="2" fill="#fff" opacity="0.9">
+          <animate attributeName="r" values="2;2.5;2" dur="2s" repeatCount="indefinite"/>
+          <animate attributeName="opacity" values="0.9;0.6;0.9" dur="2s" repeatCount="indefinite"/>
+        </circle>
         <defs><linearGradient id="logo-grad" x1="0" y1="0" x2="56" y2="56"><stop stop-color="#dc2626"/><stop offset="1" stop-color="#991b1b"/></linearGradient></defs>
       </svg>
       <h1>REN</h1>
@@ -479,6 +681,13 @@ function cycleLang(){setLang(lang==='en'?'fa':'en')}
 function applyTheme(t){theme=t;document.documentElement.setAttribute('data-theme',t);localStorage.setItem('ren_theme',t)}
 function toggleTheme(){applyTheme(theme==='dark'?'light':'dark')}
 applyTheme(theme);setLang(lang);
+
+const card=document.getElementById('login-card');
+card.addEventListener('mousemove',e=>{const r=card.getBoundingClientRect();card.style.setProperty('--mx',((e.clientX-r.left)/r.width*100)+'%');card.style.setProperty('--my',((e.clientY-r.top)/r.height*100)+'%')});
+
+const pc=document.getElementById('particles');
+for(let i=0;i<20;i++){const p=document.createElement('div');p.className='particle';p.style.left=Math.random()*100+'%';p.style.animationDuration=(8+Math.random()*12)+'s';p.style.animationDelay=Math.random()*10+'s';p.style.width=p.style.height=(1+Math.random()*2)+'px';pc.appendChild(p)}
+
 document.getElementById('login-form').addEventListener('submit',async e=>{
   e.preventDefault();const err=document.getElementById('err-box');err.classList.remove('show');
   try{
@@ -513,7 +722,9 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--surface3);border-radius:3px}
 
 .sidebar{width:220px;background:var(--sidebar-bg);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;left:0;top:0;bottom:0;z-index:100;transition:background .3s}
-.sidebar-brand{padding:16px 16px 14px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border)}
+.sidebar-brand{padding:16px 16px 14px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);position:relative;overflow:hidden}
+.sidebar-brand::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--primary),transparent);animation:shimmer 4s ease-in-out infinite}
+@keyframes shimmer{0%,100%{opacity:0.3;transform:scaleX(0.3)}50%{opacity:0.8;transform:scaleX(1)}}
 .sidebar-brand-left{display:flex;align-items:center;gap:10px}
 .sidebar-brand-left .brand-name{font-size:15px;font-weight:700;color:var(--text);letter-spacing:-0.02em}
 .sidebar-brand-right{display:flex;gap:4px}
@@ -523,7 +734,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .nav-section{font-size:10px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.08em;padding:14px 12px 6px}
 .nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;margin:1px 0;border-radius:8px;color:var(--text2);font-size:13px;font-weight:500;cursor:pointer;transition:all .15s;text-decoration:none;border:none;background:none;width:100%;text-align:left}
 .nav-item:hover{background:var(--primary-dim);color:var(--text)}
-.nav-item.active{background:var(--primary-dim);color:var(--primary);font-weight:600}
+.nav-item.active{background:var(--primary-dim);color:var(--primary);font-weight:600;box-shadow:inset 3px 0 0 var(--primary)}
 .nav-icon{width:18px;height:18px;flex-shrink:0;opacity:0.7}
 .nav-item.active .nav-icon{opacity:1}
 .nav-badge{margin-left:auto;background:var(--surface3);color:var(--text3);font-size:10px;padding:2px 7px;border-radius:8px;font-weight:600}
@@ -537,20 +748,25 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .sidebar-footer .version{text-align:center;font-size:10px;color:var(--text3);margin-top:8px;letter-spacing:0.02em}
 
 .main{margin-left:220px;flex:1;padding:24px 28px 48px;min-height:100vh}
-.page{display:none}.page.active{display:block}
+.page{display:none;animation:pageIn .4s ease}
+.page.active{display:block}
+@keyframes pageIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 .page-header{margin-bottom:20px;display:flex;align-items:center;justify-content:space-between}
 .page-title{font-size:18px;font-weight:700;color:var(--text);letter-spacing:-0.01em}
 .page-sub{font-size:12px;color:var(--text3);margin-top:3px}
 
 .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
-.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;transition:box-shadow .2s}
-.stat-card:hover{box-shadow:var(--shadow)}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;transition:all .3s cubic-bezier(0.4,0,0.2,1);animation:cardIn .5s ease both}
+.stat-card:nth-child(1){animation-delay:.1s}.stat-card:nth-child(2){animation-delay:.2s}.stat-card:nth-child(3){animation-delay:.3s}.stat-card:nth-child(4){animation-delay:.4s}
+@keyframes cardIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.stat-card:hover{box-shadow:var(--shadow);transform:translateY(-2px)}
 .stat-label{font-size:11px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px}
 .stat-value{font-size:22px;font-weight:700;color:var(--text);letter-spacing:-0.02em}
 .stat-unit{font-size:12px;font-weight:400;color:var(--text3)}
 
-.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:12px;transition:box-shadow .2s}
-.card:hover{box-shadow:var(--shadow)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:12px;transition:all .3s cubic-bezier(0.4,0,0.2,1);animation:cardIn .5s ease both}
+.card:nth-child(1){animation-delay:.2s}.card:nth-child(2){animation-delay:.3s}
+.card:hover{box-shadow:var(--shadow);transform:translateY(-1px)}
 .card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
 .card-title{font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px;color:var(--text)}
 
@@ -583,9 +799,9 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .usage-pill .fill{height:100%;border-radius:2px;transition:width .3s}
 .usage-pill .limit{color:var(--text3)}
 
-.toggle{width:34px;height:18px;border-radius:10px;background:var(--surface3);position:relative;cursor:pointer;transition:all .2s;border:1px solid var(--border)}
-.toggle::after{content:'';position:absolute;width:12px;height:12px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all .2s}
-.toggle.on{background:var(--green);border-color:var(--green)}
+.toggle{width:34px;height:18px;border-radius:10px;background:var(--surface3);position:relative;cursor:pointer;transition:all .3s cubic-bezier(0.4,0,0.2,1);border:1px solid var(--border)}
+.toggle::after{content:'';position:absolute;width:12px;height:12px;border-radius:50%;background:var(--text3);top:2px;left:2px;transition:all .3s cubic-bezier(0.4,0,0.2,1)}
+.toggle.on{background:var(--green);border-color:var(--green);box-shadow:0 0 12px rgba(34,197,94,0.3)}
 .toggle.on::after{left:18px;background:#fff}
 
 .sys-bar{height:6px;background:var(--surface3);border-radius:3px;overflow:hidden}
@@ -607,13 +823,13 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 .empty{text-align:center;padding:40px 16px;color:var(--text3)}
 .empty-icon{font-size:32px;margin-bottom:10px;opacity:0.3}
 
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 20px;font-size:12px;font-weight:500;opacity:0;transition:all .25s;z-index:999;display:flex;align-items:center;gap:8px;box-shadow:0 8px 24px rgba(0,0,0,0.2)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 20px;font-size:12px;font-weight:500;opacity:0;transition:all .3s cubic-bezier(0.4,0,0.2,1);z-index:999;display:flex;align-items:center;gap:8px;box-shadow:0 8px 24px rgba(0,0,0,0.2);backdrop-filter:blur(20px)}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .toast.error{border-color:var(--red-dim);color:var(--red)}
 
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
 .modal-overlay.show{display:flex}
-.modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;width:100%;max-width:460px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,0.3);transform:scale(0.9);opacity:0;transition:all .3s cubic-bezier(0.34,1.56,0.64,1)}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;width:100%;max-width:460px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,0.3),0 0 40px var(--primary-glow);transform:scale(0.9);opacity:0;transition:all .4s cubic-bezier(0.34,1.56,0.64,1)}
 .modal-overlay.show .modal{transform:scale(1);opacity:1}
 .modal-title{font-size:15px;font-weight:700;margin-bottom:18px;color:var(--text)}
 .modal-close{position:absolute;top:12px;left:12px;background:var(--surface3);border:1px solid var(--border);color:var(--text3);width:28px;height:28px;border-radius:7px;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;transition:all .2s}
@@ -731,6 +947,10 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
       <span data-en="Traffic" data-fa="ترافیک">Traffic</span>
     </button>
+    <button class="nav-item" data-page="addresses">
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>
+      <span data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</span>
+    </button>
     <div class="nav-section">System</div>
     <button class="nav-item" data-page="security">
       <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
@@ -824,6 +1044,7 @@ body[dir="rtl"]{direction:rtl;text-align:right}
             <th>Remark</th>
             <th style="width:56px">Type</th>
             <th>Traffic</th>
+            <th style="width:80px">IPs</th>
             <th style="width:64px">Status</th>
             <th style="width:100px">Actions</th>
           </tr></thead>
@@ -847,6 +1068,25 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <div class="status-item"><span class="status-key">Total Traffic</span><span class="status-val" id="t-traffic">-- MB</span></div>
       <div class="status-item"><span class="status-key">Total Requests</span><span class="status-val" id="t-reqs">--</span></div>
       <div class="status-item"><span class="status-key">Uptime</span><span class="status-val" id="t-uptime">--</span></div>
+    </div>
+  </section>
+
+  <section class="page" id="page-addresses">
+    <div class="page-header">
+      <div>
+        <div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div>
+        <div class="page-sub" data-en="IPs and domains for subscription configs" data-fa="آی‌پی و دامنه‌ها برای کانفیگ‌های سابسکریپشن">IPs and domains for subscription configs</div>
+      </div>
+      <button class="btn btn-primary" onclick="showAddAddressModal()">+ Add</button>
+    </div>
+    <div class="card">
+      <div class="card-header"><div class="card-title" data-en="Clean IP List" data-fa="لیست آی‌پی تمیز">Clean IP List</div></div>
+      <div class="status-item" style="flex-direction:column;gap:8px">
+        <div style="display:flex;justify-content:space-between;width:100%">
+          <span class="status-key" style="color:var(--text3);font-size:11px">Default: www.speedtest.net</span>
+        </div>
+        <div id="address-list" style="display:flex;flex-direction:column;gap:6px;width:100%"></div>
+      </div>
     </div>
   </section>
 
@@ -884,6 +1124,10 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <select class="form-select" id="new-unit"><option value="GB">GB</option></select>
       </div>
     </div>
+    <div class="form-group">
+      <label class="form-label">Max IPs</label>
+      <input class="form-input" id="new-maxconn" type="number" min="0" step="1" placeholder="0 = Unlimited">
+    </div>
     <button class="btn btn-primary" onclick="createLink()" style="width:100%;margin-top:8px;justify-content:center">Create</button>
   </div>
 </div>
@@ -905,6 +1149,48 @@ body[dir="rtl"]{direction:rtl;text-align:right}
       <button class="btn btn-primary btn-sm" onclick="downloadQR()" style="padding:8px 20px">Download</button>
       <button class="btn btn-secondary btn-sm" onclick="$('#qr-modal').classList.remove('show')" style="padding:8px 20px">Close</button>
     </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="edit-modal" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="modal" style="position:relative">
+    <button class="modal-close" onclick="$('#edit-modal').classList.remove('show')">x</button>
+    <div class="modal-title" id="edit-title">Edit Inbound</div>
+    <input type="hidden" id="edit-uid">
+    <div class="form-group">
+      <label class="form-label">Name</label>
+      <input class="form-input" id="edit-name" readonly style="opacity:0.6;cursor:not-allowed">
+    </div>
+    <div class="form-row">
+      <div class="form-group" style="flex:1">
+        <label class="form-label">Traffic Limit</label>
+        <input class="form-input" id="edit-limit" type="number" min="0" step="0.1" placeholder="0 = Unlimited">
+      </div>
+      <div class="form-group" style="min-width:80px;max-width:100px">
+        <label class="form-label">Unit</label>
+        <select class="form-select" id="edit-unit"><option value="GB">GB</option></select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Max IPs</label>
+      <input class="form-input" id="edit-maxconn" type="number" min="0" step="1" placeholder="0 = Unlimited">
+    </div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="btn btn-primary" onclick="saveEdit()" style="flex:1;justify-content:center">Save</button>
+      <button class="btn btn-danger" onclick="resetEditTraffic()" style="justify-content:center">Reset Traffic</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="add-address-modal" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="modal" style="position:relative">
+    <button class="modal-close" onclick="$('#add-address-modal').classList.remove('show')">x</button>
+    <div class="modal-title" data-en="Add Clean IP" data-fa="افزودن آی‌پی تمیز">Add Clean IP</div>
+    <div class="form-group">
+      <label class="form-label" data-en="IPs or Domains (one per line)" data-fa="آی‌پی یا دامنه (هر خط یکی)">IPs or Domains (one per line)</label>
+      <textarea class="form-input" id="new-address" rows="5" placeholder="8.8.8.8&#10;example.com&#10;1.0.0.1" style="resize:vertical;font-family:monospace"></textarea>
+    </div>
+    <button class="btn btn-primary" onclick="addAddresses()" style="width:100%;margin-top:8px;justify-content:center" data-en="Add All" data-fa="افزودن همه">Add All</button>
   </div>
 </div>
 
@@ -932,10 +1218,11 @@ function esc(s){return s.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,
 async function loadStats(){
   try{
     const r=await fetch('/stats');if(!r.ok)throw new Error();statsData=await r.json();
-    $('#s-traffic').innerHTML=statsData.total_traffic_mb+'<span class="stat-unit"> MB</span>';
-    $('#s-links').textContent=statsData.links_count;
-    $('#s-uptime').textContent=statsData.uptime;
-    $('#s-domain').textContent=statsData.domain;
+    const pulse=(el,val)=>{if(el.textContent!==val){el.style.transition='color .2s';el.style.color='var(--primary)';el.textContent=val;setTimeout(()=>el.style.color='',400)}};
+    pulse($('#s-traffic'),statsData.total_traffic_mb+' MB');$('#s-traffic').innerHTML=statsData.total_traffic_mb+'<span class="stat-unit"> MB</span>';
+    pulse($('#s-links'),statsData.links_count);
+    pulse($('#s-uptime'),statsData.uptime);
+    pulse($('#s-domain'),statsData.domain);
     $('#links-badge').textContent=statsData.links_count;
     $('#last-update').textContent=(lang==='fa'?'Last update: ':'Updated: ')+new Date().toLocaleTimeString(lang==='fa'?'fa-IR':'en-US');
     if($('#t-traffic'))$('#t-traffic').textContent=statsData.total_traffic_mb+' MB';
@@ -960,18 +1247,20 @@ function renderLinks(links){
     const pct=lim>0?Math.min(100,(u/lim)*100):0;
     const col=pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--primary)';
     const i=idx--;
-    return {l,uF,lF,pct,col,i};
+    return {l,uF,lF,pct,col,i,maxConn:l.max_connections||0,curConn:l.current_connections||0};
   });
   tbody.innerHTML=rows.map(r=>`<tr>
     <td style="color:var(--text3);font-size:11px">${r.i}</td>
     <td style="font-weight:600;font-size:13px">${esc(r.l.label)}</td>
     <td><span class="tag tag-vless">VLESS</span></td>
     <td><div class="usage-pill"><span class="used">${r.uF}</span><div class="bar"><div class="fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="limit">${r.lF}</span></div></td>
+    <td style="font-size:12px;font-weight:600;color:${r.maxConn>0&&r.curConn>=r.maxConn?'var(--red)':'var(--text2)'}">${r.curConn}/${r.maxConn||'∞'}</td>
     <td><span class="tag ${r.l.active?'tag-active':'tag-disabled'}">${r.l.active?'On':'Off'}</span></td>
     <td><div style="display:flex;gap:3px;align-items:center">
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="toggleLink(this)" title="Toggle"></button>
-      <button class="btn btn-secondary btn-sm" onclick="showDetail('${r.l.uuid}')" title="Info">i</button>
+      <button class="btn btn-secondary btn-sm" onclick="showEditModal('${r.l.uuid}')" title="Edit" style="background:rgba(251,191,36,0.1);color:var(--yellow);border:1px solid rgba(251,191,36,0.2)">e</button>
       <button class="btn-copy" onclick="copyLinkText('${esc(r.l.vless_link)}')" title="Copy">c</button>
+      <button class="btn-copy" onclick="copySubLink('${r.l.uuid}')" title="Sub" style="background:var(--green-dim);color:var(--green);border:1px solid rgba(34,197,94,0.15)">s</button>
       <button class="btn-qr" onclick="showQRText('${esc(r.l.vless_link)}')" title="QR">qr</button>
       <button class="btn btn-danger btn-sm" onclick="deleteLink('${r.l.uuid}')" title="Delete">x</button>
     </div></td>
@@ -987,11 +1276,12 @@ function renderLinks(links){
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="toggleLink(this)"></button>
     </div>
     <div class="usage-pill"><span class="used">${r.uF}</span><div class="bar"><div class="fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="limit">${r.lF}</span></div>
+    <div style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2)"><span style="font-weight:600;color:${r.maxConn>0&&r.curConn>=r.maxConn?'var(--red)':'var(--text)'}">${r.curConn}/${r.maxConn||'∞'}</span> <span>IPs</span></div>
     <div class="inbound-card-actions">
-      <button class="btn btn-secondary btn-sm" onclick="showDetail('${r.l.uuid}')">i</button>
-      <button class="btn-copy" onclick="copyLinkText('${esc(r.l.vless_link)}')">c</button>
+      <button class="btn btn-secondary btn-sm" onclick="showEditModal('${r.l.uuid}')" style="background:rgba(251,191,36,0.1);color:var(--yellow);border:1px solid rgba(251,191,36,0.2)">e</button>
+      <button class="btn-copy" onclick="copyAllConfigs('${r.l.uuid}')">c</button>
+      <button class="btn-copy" onclick="copySubLink('${r.l.uuid}')" style="background:var(--green-dim);color:var(--green);border:1px solid rgba(34,197,94,0.15)">s</button>
       <button class="btn-qr" onclick="showQRText('${esc(r.l.vless_link)}')">qr</button>
-      <button class="btn btn-secondary btn-sm" onclick="resetUsage('${r.l.uuid}')">r</button>
       <button class="btn btn-danger btn-sm" onclick="deleteLink('${r.l.uuid}')">x</button>
     </div>
   </div>`).join('');
@@ -1017,13 +1307,50 @@ async function quickCreate(limit,unit){
 }
 
 async function createLink(){
-  const label=$('#new-label').value.trim()||'New Link';const val=parseFloat($('#new-limit').value)||0;const unit='GB';
+  const label=$('#new-label').value.trim()||'New Link';const val=parseFloat($('#new-limit').value)||0;const unit='GB';const maxconn=parseInt($('#new-maxconn').value)||0;
   if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return;}
-  try{const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:val,limit_unit:unit})});if(!r.ok)throw new Error();toast('Created');$('#new-label').value='';$('#new-limit').value='';$('#add-modal').classList.remove('show');await loadLinks();await loadStats();}catch(e){toast('Error',true)}
+  try{const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:val,limit_unit:unit,max_connections:maxconn})});if(!r.ok)throw new Error();toast('Created');$('#new-label').value='';$('#new-limit').value='';$('#new-maxconn').value='';$('#add-modal').classList.remove('show');await loadLinks();await loadStats();}catch(e){toast('Error',true)}
 }
 
 async function resetUsage(uid){try{await fetch(`/api/links/${uid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');await loadLinks();}catch(e){}}
 async function deleteLink(uid){if(!confirm('Delete this inbound?'))return;try{await fetch(`/api/links/${uid}`,{method:'DELETE'});toast('Deleted');await loadLinks();await loadStats();}catch(e){}}
+
+function showEditModal(uid){
+  const l=allLinks.find(x=>x.uuid===uid);if(!l)return;
+  $('#edit-uid').value=uid;
+  $('#edit-name').value=l.label;
+  const gb=l.limit_bytes/1073741824;
+  $('#edit-limit').value=l.limit_bytes>0?gb:'';
+  $('#edit-unit').value='GB';
+  $('#edit-maxconn').value=l.max_connections>0?l.max_connections:'';
+  $('#edit-title').textContent='Edit: '+l.label;
+  $('#edit-modal').classList.add('show');
+}
+
+async function saveEdit(){
+  const uid=$('#edit-uid').value;
+  const val=parseFloat($('#edit-limit').value)||0;
+  const unit=$('#edit-unit').value;
+  const maxconn=parseInt($('#edit-maxconn').value)||0;
+  try{
+    const r=await fetch(`/api/links/${uid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit_value:val,limit_unit:unit,max_connections:maxconn})});
+    if(!r.ok)throw new Error();
+    toast('Updated');
+    $('#edit-modal').classList.remove('show');
+    await loadLinks();
+  }catch(e){toast('Error',true)}
+}
+
+async function resetEditTraffic(){
+  const uid=$('#edit-uid').value;
+  if(!confirm('Reset traffic usage to zero?'))return;
+  try{
+    const r=await fetch(`/api/links/${uid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});
+    if(!r.ok)throw new Error();
+    toast('Traffic reset');
+    await loadLinks();
+  }catch(e){toast('Error',true)}
+}
 
 function showDetail(uid){
   const l=allLinks.find(x=>x.uuid===uid);if(!l)return;
@@ -1043,11 +1370,15 @@ function showDetail(uid){
       <div class="detail-col"><div class="detail-label">Usage</div><div class="detail-value">${pct.toFixed(1)}%</div></div>
     </div>
     <div class="sys-bar" style="margin-bottom:12px"><div class="sys-bar-fill" style="width:${pct}%;background:${col}"></div></div>
-    <div style="margin-bottom:12px"><div class="detail-label">Created</div><div class="detail-value" style="font-family:inherit">${created}</div></div>
+    <div class="detail-row">
+      <div class="detail-col"><div class="detail-label">Connected IPs</div><div class="detail-value">${l.current_connections||0} / ${l.max_connections||'Unlimited'}</div></div>
+      <div class="detail-col"><div class="detail-label">Created</div><div class="detail-value" style="font-family:inherit">${created}</div></div>
+    </div>
     <div style="margin-bottom:0"><div class="detail-label">VLESS Link</div><div class="detail-value">${esc(l.vless_link)}</div></div>
     <div class="detail-actions">
-      <button class="btn-copy" onclick="copyLinkText('${esc(l.vless_link)}');$('#detail-modal').classList.remove('show')" style="padding:8px 18px;font-size:12px">Copy</button>
+      <button class="btn-copy" onclick="copyAllConfigs('${l.uuid}');$('#detail-modal').classList.remove('show')" style="padding:8px 18px;font-size:12px">Copy All</button>
       <button class="btn-qr" onclick="showQRText('${esc(l.vless_link)}');$('#detail-modal').classList.remove('show')" style="padding:8px 18px;font-size:12px">QR Code</button>
+      <button class="btn btn-secondary btn-sm" onclick="copySubLink('${l.uuid}')" style="padding:8px 18px;font-size:12px">Subscription URL</button>
       <button class="btn btn-secondary btn-sm" onclick="resetUsage('${l.uuid}');$('#detail-modal').classList.remove('show')" style="padding:8px 18px">Reset Traffic</button>
     </div>`;
   $('#detail-modal').classList.add('show');
@@ -1056,6 +1387,14 @@ function showDetail(uid){
 function copyLinkText(txt){navigator.clipboard.writeText(txt).then(()=>toast('Copied to clipboard')).catch(()=>toast('Failed to copy',true))}
 function showQRText(txt){if(!txt)return;const box=document.querySelector('.qr-box');box.classList.remove('animate-in','animate-glow');$('#qr-img').src='https://api.qrserver.com/v1/create-qr-code/?size=300x300&data='+encodeURIComponent(txt);$('#qr-modal').classList.add('show');requestAnimationFrame(()=>{box.classList.add('animate-in');setTimeout(()=>box.classList.add('animate-glow'),500)})}
 function downloadQR(){const img=$('#qr-img');if(!img.src)return;const a=document.createElement('a');a.href=img.src;a.download='ren-qr.png';a.click()}
+async function copySubLink(uid){
+  try{
+    const domain=location.host;
+    const subUrl=`https://${domain}/sub/${uid}`;
+    await navigator.clipboard.writeText(subUrl);
+    toast('Subscription URL copied');
+  }catch(e){toast('Failed to copy',true)}
+}
 
 async function changePassword(){
   const cur=$('#cur-pw').value;const nw=$('#new-pw').value;
@@ -1064,8 +1403,66 @@ async function changePassword(){
 }
 
 applyTheme(theme);setLang(lang);
-loadStats();loadLinks();
+loadStats();loadLinks();loadAddresses();
 setInterval(()=>{loadStats()},10000);
+
+let allAddresses=[];
+
+async function loadAddresses(){
+  try{
+    const r=await fetch('/api/addresses');
+    if(!r.ok)throw new Error();
+    const d=await r.json();
+    allAddresses=d.addresses||[];
+    renderAddresses();
+  }catch(e){}
+}
+
+function renderAddresses(){
+  const list=$('#address-list');if(!list)return;
+  if(!allAddresses.length){list.innerHTML='<div style="color:var(--text3);font-size:12px;padding:8px 0">No addresses added</div>';return;}
+  list.innerHTML=allAddresses.map((a,i)=>`
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:8px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:14px">🌐</span>
+        <div>
+          <div style="font-size:13px;font-weight:600;color:var(--text)">${esc(a)}</div>
+          <div style="font-size:10px;color:var(--text3)">Address #${i+1}</div>
+        </div>
+      </div>
+      <button class="btn btn-danger btn-sm" onclick="deleteAddress(${i})" style="padding:4px 10px">x</button>
+    </div>
+  `).join('');
+}
+
+function showAddAddressModal(){$('#new-address').value='';$('#add-address-modal').classList.add('show')}
+
+async function addAddresses(){
+  const text=$('#new-address').value.trim();
+  if(!text){toast('Enter at least one IP or domain',true);return;}
+  const lines=text.split('\n').map(l=>l.trim()).filter(l=>l);
+  let added=0;let errors=0;
+  for(const addr of lines){
+    if(!/^[a-zA-Z0-9\-_. ]+$/.test(addr)){errors++;continue;}
+    try{
+      const r=await fetch('/api/addresses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});
+      if(r.ok)added++;else errors++;
+    }catch(e){errors++;}
+  }
+  if(added>0)toast(`Added ${added} address(es)`);
+  if(errors>0)toast(`${errors} failed`,true);
+  if(added>0){$('#add-address-modal').classList.remove('show');await loadAddresses();}
+}
+
+async function deleteAddress(index){
+  if(!confirm('Delete this address?'))return;
+  try{
+    const r=await fetch(`/api/addresses/${index}`,{method:'DELETE'});
+    if(!r.ok)throw new Error();
+    toast('Deleted');
+    await loadAddresses();
+  }catch(e){toast('Error',true)}
+}
 
 let chartLabels=[];let chartData=[];
 function initChart(){
